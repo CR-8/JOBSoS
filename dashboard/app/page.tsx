@@ -1,8 +1,8 @@
-import { fetchResumes, fetchHealth } from "@/lib/api";
+import { fetchResumes, fetchHealth, type Resume, type HealthStatus } from "@/lib/api";
 
 export default async function DashboardHome() {
-  let resumes = [];
-  let health = { status: "unknown" };
+  let resumes: Resume[] = [];
+  let health: HealthStatus = { status: "unknown" };
 
   try {
     [resumes, health] = await Promise.all([
