@@ -1,0 +1,398 @@
+# =============================================================================
+# CareerHub - Coolify-Optimized Docker Compose
+# =============================================================================
+# Differs from docker-compose.yml:
+#   - Removes Traefik (Coolify brings its own reverse proxy)
+#   - Exposes each public service on unique host ports
+#   - No Traefik labels (Coolify's proxy handles routing)
+#   - Dashboard rewrites route to internal Docker network (unchanged)
+#
+# Coolify Setup:
+#   1. Deploy this file as a "Docker Compose" resource
+#   2. Configure Coolify proxy routes for each service:
+#      ┌──────────────────────────┬──────────────────────────┬───────────┐
+#      │ Service              │ Domain/Path             │ Port     │
+#      ├──────────────────────────┼──────────────────────────┼───────────┤
+#      │ dashboard           │ careerhub.example.com /  │ 3000     │
+#      │ reactive-resume     │ careerhub.example.com /resume/* │ 3003 │
+#      │ jobops              │ careerhub.example.com /jobs/*   │ 3005 │
+#      │ resume-sync-api     │ careerhub.example.com /api/*    │ 8000 │
+#      │ authentik-server    │ auth.careerhub.example.com      │ 9090 │
+#      └──────────────────────────┴──────────────────────────┴───────────┘
+#      Use a SUBDOMAIN for Authentik (auth.*) — sub-path routing (/auth/*)
+#      is not supported by Authentik.
+#   3. In the Dashboard settings inside Coolify, set these env vars:
+#      - NEXT_PUBLIC_API_URL: /api
+#      - NEXT_PUBLIC_RESUME_URL: /resume
+#      - NEXT_PUBLIC_JOBS_URL: /jobs
+#      - NEXT_PUBLIC_AUTH_URL: https://auth.careerhub.example.com
+# =============================================================================
+
+name: careerhub
+
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
+networks:
+  careerhub-net:
+    driver: bridge
+    name: careerhub-net
+
+# -----------------------------------------------------------------------------
+# Volumes
+# -----------------------------------------------------------------------------
+volumes:
+  postgres_data:
+    name: careerhub-postgres
+  redis_data:
+    name: careerhub-redis
+  seaweedfs_data:
+    name: careerhub-seaweedfs
+  authentik_db:
+    name: careerhub-authentik-db
+  authentik_media:
+    name: careerhub-authentik-media
+  authentik_certs:
+    name: careerhub-authentik-certs
+  authentik_redis:
+    name: careerhub-authentik-redis
+  rr_data:
+    name: careerhub-rr-data
+  jobops_data:
+    name: careerhub-jobops-data
+  jobops_codex:
+    name: careerhub-jobops-codex
+  sync_db:
+    name: careerhub-sync-db
+  traefik_certs:
+    name: careerhub-traefik-certs
+
+# =============================================================================
+# Services
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    container_name: careerhub-postgres
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./configs/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Redis - Shared cache
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: careerhub-redis
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+      - ./configs/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # SeaweedFS - S3-compatible storage
+  # ---------------------------------------------------------------------------
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    container_name: careerhub-seaweedfs
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: server -s3 -filer -dir=/data -ip=0.0.0.0
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-seaweedfs}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-seaweedfs}
+    volumes:
+      - seaweedfs_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8888"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  seaweedfs-init:
+    image: quay.io/minio/mc:latest
+    container_name: careerhub-seaweedfs-init
+    restart: "no"
+    networks:
+      - careerhub-net
+    entrypoint: >
+      /bin/sh -c "
+        sleep 5;
+        mc alias set seaweedfs http://seaweedfs:8333 ${S3_ACCESS_KEY_ID:-seaweedfs} ${S3_SECRET_ACCESS_KEY:-seaweedfs};
+        mc mb --ignore-existing seaweedfs/reactive-resume;
+        exit 0;
+      "
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Authentik - Single Sign-On
+  # ===========================================================================
+  authentik-redis:
+    image: redis:7-alpine
+    container_name: careerhub-authentik-redis
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: redis-server --save 60s 1 --loglevel warning
+    volumes:
+      - authentik_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-2025.6}
+    container_name: careerhub-authentik-server
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: server
+    ports:
+      - "9090:9000"
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+    volumes:
+      - authentik_media:/media
+      - authentik_certs:/certs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9000/-/health/ready/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-2025.6}
+    container_name: careerhub-authentik-worker
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: worker
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+    volumes:
+      - authentik_media:/media
+      - authentik_certs:/certs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+      authentik-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "celery", "-A", "authentik.root.celery", "inspect", "ping", "-d", "celery@$(hostname)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ===========================================================================
+  # Reactive Resume
+  # ===========================================================================
+  reactive-resume:
+    image: ghcr.io/amruthpillai/reactive-resume:latest
+    container_name: careerhub-reactive-resume
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    ports:
+      - "3003:3000"
+    environment:
+      PORT: "3000"
+      APP_URL: "${APP_URL:-https://${DOMAIN:-careerhub.local}}/resume"
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/reactive_resume"
+      REDIS_URL: "redis://redis:6379/0"
+      AUTH_SECRET: "${RR_AUTH_SECRET}"
+      ENCRYPTION_SECRET: "${RR_ENCRYPTION_SECRET}"
+      S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID:-seaweedfs}"
+      S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY:-seaweedfs}"
+      S3_REGION: "${S3_REGION:-us-east-1}"
+      S3_ENDPOINT: "http://seaweedfs:8333"
+      S3_BUCKET: "reactive-resume"
+      S3_FORCE_PATH_STYLE: "true"
+      OAUTH_PROVIDER_NAME: "${OAUTH_PROVIDER_NAME:-CareerHub SSO}"
+      OAUTH_CLIENT_ID: "${RR_OIDC_CLIENT_ID}"
+      OAUTH_CLIENT_SECRET: "${RR_OIDC_CLIENT_SECRET}"
+      OAUTH_DISCOVERY_URL: "${OAUTH_DISCOVERY_URL}"
+      OAUTH_SCOPES: "openid profile email"
+      FLAG_DISABLE_SIGNUPS: "${RR_DISABLE_SIGNUPS:-true}"
+      FLAG_SHOW_SPONSORS: "false"
+    volumes:
+      - rr_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+      seaweedfs-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1));"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ===========================================================================
+  # JobOps
+  # ===========================================================================
+  jobops:
+    image: ghcr.io/dakheera47/job-ops:latest
+    container_name: careerhub-jobops
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    ports:
+      - "3005:3001"
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      PYTHON_PATH: "/usr/bin/python3"
+      CODEX_HOME: "/app/codex-home"
+      BASIC_AUTH_USER: "${JOBOPS_AUTH_USER:-admin}"
+      BASIC_AUTH_PASSWORD: "${JOBOPS_AUTH_PASSWORD:-changeme}"
+      JOBOPS_PUBLIC_BASE_URL: "${APP_URL:-https://${DOMAIN:-careerhub.local}}/jobs"
+      RXRESUME_API_KEY: "${RXRESUME_API_KEY:-}"
+      RXRESUME_URL: "http://reactive-resume:3000"
+    volumes:
+      - jobops_data:/app/data
+      - jobops_codex:/app/codex-home
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ===========================================================================
+  # Resume Sync API
+  # ===========================================================================
+  resume-sync-api:
+    build:
+      context: ./resume-sync-api
+      dockerfile: Dockerfile
+    container_name: careerhub-resume-sync
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/resume_sync"
+      REDIS_URL: "redis://redis:6379/1"
+      REACTIVE_RESUME_URL: "http://reactive-resume:3000"
+      REACTIVE_RESUME_API_KEY: "${RR_SYNC_API_KEY:-}"
+      JOBOPS_URL: "http://jobops:3001"
+      JOBOPS_AUTH_USER: "${JOBOPS_AUTH_USER:-admin}"
+      JOBOPS_AUTH_PASSWORD: "${JOBOPS_AUTH_PASSWORD:-changeme}"
+      JWT_SECRET: "${SYNC_JWT_SECRET}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      reactive-resume:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  # ===========================================================================
+  # CareerHub Dashboard
+  # ===========================================================================
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: careerhub-dashboard
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: "/api"
+      NEXT_PUBLIC_RESUME_URL: "/resume"
+      NEXT_PUBLIC_JOBS_URL: "/jobs"
+      NEXT_PUBLIC_AUTH_URL: "/auth"
+      NEXT_PUBLIC_DOMAIN: "${DOMAIN:-careerhub.local}"
+      SYNC_API_URL: "http://resume-sync-api:8000"
+      AUTHENTIK_URL: "http://authentik-server:9000"
+      AUTHENTIK_CLIENT_ID: "${DASHBOARD_OIDC_CLIENT_ID}"
+      AUTHENTIK_CLIENT_SECRET: "${DASHBOARD_OIDC_CLIENT_SECRET}"
+    depends_on:
+      resume-sync-api:
+        condition: service_healthy
+      authentik-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
