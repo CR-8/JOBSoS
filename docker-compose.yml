@@ -1,0 +1,520 @@
+# =============================================================================
+# CareerHub - Unified Self-Hosted Career Management Platform
+# Docker Compose Stack
+# =============================================================================
+# Integrates Reactive Resume (resume builder) and JobOps (job application tracker)
+# behind a single Traefik reverse proxy with a unified dashboard.
+#
+# Services:
+#   traefik         - Reverse proxy / TLS termination / path routing
+#   postgres        - Shared PostgreSQL instance (separate DBs per app)
+#   redis           - Shared Redis cache (separate logical DBs per app)
+#   seaweedfs       - S3-compatible storage for Reactive Resume uploads
+#   authentik-*     - Single Sign-On identity provider (server + worker + redis)
+#   reactive-resume - Resume builder (upstream, unmodified)
+#   jobops          - Job search & application tracker (upstream, unmodified)
+#   resume-sync-api - FastAPI integration bridge between RR and JobOps
+#   dashboard       - Next.js unified entry point
+#
+# Usage:
+#   cp .env.example .env  &&  docker compose up -d
+# =============================================================================
+
+name: careerhub
+
+# -----------------------------------------------------------------------------
+# Networks
+# All services share one internal Docker network.
+# Only Traefik exposes ports to the host.
+# -----------------------------------------------------------------------------
+networks:
+  careerhub-net:
+    driver: bridge
+    name: careerhub-net
+
+# -----------------------------------------------------------------------------
+# Volumes
+# Named volumes for persistence. Each service owns its volume.
+# -----------------------------------------------------------------------------
+volumes:
+  postgres_data:
+    name: careerhub-postgres
+  redis_data:
+    name: careerhub-redis
+  seaweedfs_data:
+    name: careerhub-seaweedfs
+  authentik_db:
+    name: careerhub-authentik-db
+  authentik_media:
+    name: careerhub-authentik-media
+  authentik_certs:
+    name: careerhub-authentik-certs
+  authentik_redis:
+    name: careerhub-authentik-redis
+  rr_data:
+    name: careerhub-rr-data
+  jobops_data:
+    name: careerhub-jobops-data
+  jobops_codex:
+    name: careerhub-jobops-codex
+  sync_db:
+    name: careerhub-sync-db
+  traefik_certs:
+    name: careerhub-traefik-certs
+
+# =============================================================================
+# Services
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # Traefik - Reverse Proxy
+  # The ONLY service that exposes ports publicly.
+  # Routes:
+  #   /          -> dashboard      (Next.js)
+  #   /resume     -> reactive-resume
+  #   /jobs       -> jobops
+  #   /api        -> resume-sync-api
+  #   /auth       -> authentik
+  # ---------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3.2
+    container_name: careerhub-traefik
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command:
+      - "--api.insecure=true"
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=careerhub-net"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.http.tls=true"
+      - "--entrypoints.websecure.http.tls.certResolver=letsencrypt"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@careerhub.local}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/certs/acme.json"
+      - "--log.level=${TRAEFIK_LOG_LEVEL:-INFO}"
+      - "--accesslog=true"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./reverse-proxy/dynamic:/etc/traefik/dynamic:ro
+      - traefik_certs:/certs
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL - Shared database server
+  # Each application gets its own logical database. No shared tables.
+  #   - reactive_resume  (Reactive Resume)
+  #   - jobops           (JobOps uses SQLite natively, but DB is reserved)
+  #   - resume_sync      (Resume Sync API metadata)
+  #   - authentik        (SSO identity provider)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    container_name: careerhub-postgres
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./configs/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # No host ports exposed — internal only
+
+  # ---------------------------------------------------------------------------
+  # Redis - Shared cache
+  # Each application uses a different Redis logical DB index to avoid key
+  # collisions:
+  #   db 0 -> Reactive Resume (agent workspace)
+  #   db 1 -> Resume Sync API
+  #   db 2 -> Authentik
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: careerhub-redis
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+      - ./configs/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    # No host ports exposed — internal only
+
+  # ---------------------------------------------------------------------------
+  # SeaweedFS - S3-compatible storage for Reactive Resume file uploads
+  # ---------------------------------------------------------------------------
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    container_name: careerhub-seaweedfs
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: server -s3 -filer -dir=/data -ip=0.0.0.0
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-seaweedfs}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-seaweedfs}
+    volumes:
+      - seaweedfs_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8888"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # No host ports exposed — internal only
+
+  seaweedfs-init:
+    image: quay.io/minio/mc:latest
+    container_name: careerhub-seaweedfs-init
+    restart: "no"
+    networks:
+      - careerhub-net
+    entrypoint: >
+      /bin/sh -c "
+        sleep 5;
+        mc alias set seaweedfs http://seaweedfs:8333 ${S3_ACCESS_KEY_ID:-seaweedfs} ${S3_SECRET_ACCESS_KEY:-seaweedfs};
+        mc mb --ignore-existing seaweedfs/reactive-resume;
+        exit 0;
+      "
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Authentik - Single Sign-On (OIDC Provider)
+  # ===========================================================================
+  # Authentik serves as the central identity provider.
+  # Both Reactive Resume and the CareerHub Dashboard authenticate against it
+  # via OpenID Connect (OIDC).
+  #
+  # JobOps uses its own basic-auth/JWT; we document this limitation in README.
+
+  authentik-redis:
+    image: redis:7-alpine
+    container_name: careerhub-authentik-redis
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: redis-server --save 60s 1 --loglevel warning
+    volumes:
+      - authentik_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-2025.6}
+    container_name: careerhub-authentik-server
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: server
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+    volumes:
+      - authentik_media:/media
+      - authentik_certs:/certs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9000/-/health/ready/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=careerhub-net"
+      - "traefik.http.routers.authentik.rule=Host(`${DOMAIN:-careerhub.local}`) && PathPrefix(`/auth`)"
+      - "traefik.http.routers.authentik.entrypoints=websecure"
+      - "traefik.http.routers.authentik.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.authentik.priority=10"
+      - "traefik.http.routers.authentik.middlewares=authentik-stripprefix"
+      - "traefik.http.middlewares.authentik-stripprefix.stripprefix.prefixes=/auth"
+      - "traefik.http.services.authentik.loadbalancer.server.port=9000"
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-2025.6}
+    container_name: careerhub-authentik-worker
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    command: worker
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__USER: ${POSTGRES_USER}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${POSTGRES_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+    volumes:
+      - authentik_media:/media
+      - authentik_certs:/certs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+      authentik-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "celery", "-A", "authentik.root.celery", "inspect", "ping", "-d", "celery@$(hostname)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ===========================================================================
+  # Reactive Resume (upstream, unmodified)
+  # ===========================================================================
+  # Source: https://github.com/AmruthPillai/Reactive-Resume (v5)
+  # Uses pre-built image from GHCR. No modifications to upstream code.
+  # Custom OAuth env vars wire it to Authentik for SSO.
+  # ---------------------------------------------------------------------------
+  reactive-resume:
+    image: ghcr.io/amruthpillai/reactive-resume:latest
+    container_name: careerhub-reactive-resume
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    environment:
+      PORT: "3000"
+      APP_URL: "${APP_URL:-https://${DOMAIN:-careerhub.local}}/resume"
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/reactive_resume"
+      REDIS_URL: "redis://redis:6379/0"
+      AUTH_SECRET: "${RR_AUTH_SECRET}"
+      ENCRYPTION_SECRET: "${RR_ENCRYPTION_SECRET}"
+      S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID:-seaweedfs}"
+      S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY:-seaweedfs}"
+      S3_REGION: "${S3_REGION:-us-east-1}"
+      S3_ENDPOINT: "http://seaweedfs:8333"
+      S3_BUCKET: "reactive-resume"
+      S3_FORCE_PATH_STYLE: "true"
+      # Authentik OIDC integration
+      OAUTH_PROVIDER_NAME: "${OAUTH_PROVIDER_NAME:-CareerHub SSO}"
+      OAUTH_CLIENT_ID: "${RR_OIDC_CLIENT_ID}"
+      OAUTH_CLIENT_SECRET: "${RR_OIDC_CLIENT_SECRET}"
+      OAUTH_DISCOVERY_URL: "${OAUTH_DISCOVERY_URL}"
+      OAUTH_SCOPES: "openid profile email"
+      # Feature flags
+      FLAG_DISABLE_SIGNUPS: "${RR_DISABLE_SIGNUPS:-true}"
+      FLAG_SHOW_SPONSORS: "false"
+    volumes:
+      - rr_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+      seaweedfs-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1));"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=careerhub-net"
+      - "traefik.http.routers.rr.rule=Host(`${DOMAIN:-careerhub.local}`) && PathPrefix(`/resume`)"
+      - "traefik.http.routers.rr.entrypoints=websecure"
+      - "traefik.http.routers.rr.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.rr.middlewares=rr-stripprefix"
+      - "traefik.http.middlewares.rr-stripprefix.stripprefix.prefixes=/resume"
+      - "traefik.http.services.rr.loadbalancer.server.port=3000"
+
+  # ===========================================================================
+  # JobOps (upstream, unmodified)
+  # ===========================================================================
+  # Source: https://github.com/DaKheera47/job-ops
+  # Uses pre-built image from GHCR. No modifications to upstream code.
+  # JobOps uses SQLite internally and its own basic-auth; SSO bridging is
+  # documented in README.
+  # ---------------------------------------------------------------------------
+  jobops:
+    image: ghcr.io/dakheera47/job-ops:latest
+    container_name: careerhub-jobops
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      PYTHON_PATH: "/usr/bin/python3"
+      CODEX_HOME: "/app/codex-home"
+      BASIC_AUTH_USER: "${JOBOPS_AUTH_USER:-admin}"
+      BASIC_AUTH_PASSWORD: "${JOBOPS_AUTH_PASSWORD:-changeme}"
+      JOBOPS_PUBLIC_BASE_URL: "${APP_URL:-https://${DOMAIN:-careerhub.local}}/jobs"
+      # RxResume integration (uses public API by default; self-hosted override)
+      RXRESUME_API_KEY: "${RXRESUME_API_KEY:-}"
+      RXRESUME_URL: "http://reactive-resume:3000"
+    volumes:
+      - jobops_data:/app/data
+      - jobops_codex:/app/codex-home
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=careerhub-net"
+      - "traefik.http.routers.jobops.rule=Host(`${DOMAIN:-careerhub.local}`) && PathPrefix(`/jobs`)"
+      - "traefik.http.routers.jobops.entrypoints=websecure"
+      - "traefik.http.routers.jobops.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.jobops.middlewares=jobops-stripprefix"
+      - "traefik.http.middlewares.jobops-stripprefix.stripprefix.prefixes=/jobs"
+      - "traefik.http.services.jobops.loadbalancer.server.port=3001"
+
+  # ===========================================================================
+  # Resume Sync API (CareerHub integration layer)
+  # ===========================================================================
+  # FastAPI service that bridges Reactive Resume and JobOps.
+  # Discovers resumes, stores metadata, synchronizes versions, and prepares
+  # AI extension points. Never directly manipulates upstream database tables.
+  # ---------------------------------------------------------------------------
+  resume-sync-api:
+    build:
+      context: ./resume-sync-api
+      dockerfile: Dockerfile
+    container_name: careerhub-resume-sync
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/resume_sync"
+      REDIS_URL: "redis://redis:6379/1"
+      REACTIVE_RESUME_URL: "http://reactive-resume:3000"
+      REACTIVE_RESUME_API_KEY: "${RR_SYNC_API_KEY:-}"
+      JOBOPS_URL: "http://jobops:3001"
+      JOBOPS_AUTH_USER: "${JOBOPS_AUTH_USER:-admin}"
+      JOBOPS_AUTH_PASSWORD: "${JOBOPS_AUTH_PASSWORD:-changeme}"
+      JWT_SECRET: "${SYNC_JWT_SECRET}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      reactive-resume:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=careerhub-net"
+      - "traefik.http.routers.syncapi.rule=Host(`${DOMAIN:-careerhub.local}`) && (PathPrefix(`/api/sync`) || PathPrefix(`/api/resume`) || PathPrefix(`/api/health`))"
+      - "traefik.http.routers.syncapi.entrypoints=websecure"
+      - "traefik.http.routers.syncapi.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.syncapi.middlewares=syncapi-stripprefix"
+      - "traefik.http.middlewares.syncapi-stripprefix.stripprefix.prefixes=/api"
+      - "traefik.http.services.syncapi.loadbalancer.server.port=8000"
+
+  # ===========================================================================
+  # CareerHub Dashboard (unified entry point)
+  # ===========================================================================
+  # Lightweight Next.js app with sidebar navigation.
+  # Embeds Reactive Resume and JobOps via iframe for seamless UX.
+  # Widgets consume the Resume Sync API.
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: careerhub-dashboard
+    restart: unless-stopped
+    networks:
+      - careerhub-net
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: "/api"
+      NEXT_PUBLIC_RESUME_URL: "/resume"
+      NEXT_PUBLIC_JOBS_URL: "/jobs"
+      NEXT_PUBLIC_AUTH_URL: "/auth"
+      NEXT_PUBLIC_DOMAIN: "${DOMAIN:-careerhub.local}"
+      # Server-side internal URLs (for API calls from the dashboard server)
+      SYNC_API_URL: "http://resume-sync-api:8000"
+      AUTHENTIK_URL: "http://authentik-server:9000"
+      AUTHENTIK_CLIENT_ID: "${DASHBOARD_OIDC_CLIENT_ID}"
+      AUTHENTIK_CLIENT_SECRET: "${DASHBOARD_OIDC_CLIENT_SECRET}"
+    depends_on:
+      resume-sync-api:
+        condition: service_healthy
+      authentik-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=careerhub-net"
+      # Dashboard catches everything NOT matched by /resume, /jobs, /api, /auth
+      - "traefik.http.routers.dashboard.rule=Host(`${DOMAIN:-careerhub.local}`)"
+      - "traefik.http.routers.dashboard.priority=1"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=3000"
+
+      - "traefik.http.services.authentik.loadbalancer.server.url=http://authentik-server:9000"

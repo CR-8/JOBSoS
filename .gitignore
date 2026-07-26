@@ -1,0 +1,46 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Upstream repositories (managed via git submodules)
+services/reactive-resume/
+services/jobops/
+
+# Backups
+backups/
+
+# Data volumes (local development)
+data/
+
+# Traefik dynamic SSL certificates
+reverse-proxy/certs/
+reverse-proxy/acme.json
+
+# Node
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

@@ -1,0 +1,11 @@
+[submodule "services/reactive-resume"]
+    path = services/reactive-resume
+    url = https://github.com/AmruthPillai/Reactive-Resume.git
+    branch = main
+    shallow = true
+
+[submodule "services/jobops"]
+    path = services/jobops
+    url = https://github.com/DaKheera47/job-ops.git
+    branch = main
+    shallow = true
