@@ -3,29 +3,35 @@
 # =============================================================================
 # Differs from docker-compose.yml:
 #   - Removes Traefik (Coolify brings its own reverse proxy)
-#   - Exposes each public service on unique host ports
-#   - No Traefik labels (Coolify's proxy handles routing)
+#   - Exposes each public service on unique host ports (for direct/debug access)
+#   - Routing is done via explicit Traefik labels on each service (hardcoded
+#     below), NOT via Coolify's SERVICE_FQDN_* magic env vars — that field
+#     silently truncates any path suffix (e.g. "/resume") on save in some
+#     Coolify versions, which breaks path-based routing. Labels are
+#     deterministic and don't depend on that UI field at all.
 #   - Dashboard rewrites route to internal Docker network (unchanged)
 #
 # Coolify Setup:
 #   1. Deploy this file as a "Docker Compose" resource
-#   2. Configure Coolify proxy routes for each service:
+#   2. Set DOMAIN in the resource's env vars (e.g. careerhub.example.com)
+#      Routing is derived entirely from DOMAIN via the labels below:
 #      ┌──────────────────────────┬──────────────────────────┬───────────┐
 #      │ Service              │ Domain/Path             │ Port     │
 #      ├──────────────────────────┼──────────────────────────┼───────────┤
-#      │ dashboard           │ careerhub.example.com /  │ 3000     │
-#      │ reactive-resume     │ careerhub.example.com /resume/* │ 3003 │
-#      │ jobops              │ careerhub.example.com /jobs/*   │ 3005 │
-#      │ resume-sync-api     │ careerhub.example.com /api/*    │ 8010 │
-#      │ authentik-server    │ auth.careerhub.example.com      │ 9090 │
+#      │ dashboard           │ ${DOMAIN} /               │ 3000     │
+#      │ reactive-resume     │ ${DOMAIN} /resume/*        │ 3003 │
+#      │ jobops              │ ${DOMAIN} /jobs/*          │ 3005 │
+#      │ resume-sync-api     │ ${DOMAIN} /api/*           │ 8010 │
+#      │ authentik-server    │ auth.${DOMAIN}             │ 9090 │
 #      └──────────────────────────┴──────────────────────────┴───────────┘
 #      Use a SUBDOMAIN for Authentik (auth.*) — sub-path routing (/auth/*)
 #      is not supported by Authentik.
-#   3. In the Dashboard settings inside Coolify, set these env vars:
-#      - NEXT_PUBLIC_API_URL: /api
-#      - NEXT_PUBLIC_RESUME_URL: /resume
-#      - NEXT_PUBLIC_JOBS_URL: /jobs
-#      - NEXT_PUBLIC_AUTH_URL: https://auth.careerhub.example.com
+#   3. Leave SERVICE_FQDN_* / SERVICE_URL_* env vars blank — they're unused
+#      now that routing is hardcoded via labels. Setting them risks Coolify
+#      generating a second, conflicting (and possibly broken) router.
+#   4. Dashboard's NEXT_PUBLIC_* routing env vars are already hardcoded
+#      below (API_URL=/api, RESUME_URL=/resume, JOBS_URL=/jobs,
+#      AUTH_URL=https://auth.${DOMAIN}) — no manual Coolify config needed.
 # =============================================================================
 
 name: careerhub
@@ -170,6 +176,17 @@ services:
     image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-2025.6}
     container_name: careerhub-cf-authentik-server
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.careerhub-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.careerhub-authentik-http.rule=Host(`auth.${DOMAIN:-careerhub.local}`)"
+      - "traefik.http.routers.careerhub-authentik-http.entrypoints=http"
+      - "traefik.http.routers.careerhub-authentik-http.middlewares=careerhub-https-redirect"
+      - "traefik.http.routers.careerhub-authentik.rule=Host(`auth.${DOMAIN:-careerhub.local}`)"
+      - "traefik.http.routers.careerhub-authentik.entrypoints=https"
+      - "traefik.http.routers.careerhub-authentik.tls=true"
+      - "traefik.http.routers.careerhub-authentik.tls.certresolver=letsencrypt"
+      - "traefik.http.services.careerhub-authentik.loadbalancer.server.port=9000"
     networks:
       - careerhub-net
     command: server
@@ -242,6 +259,19 @@ services:
     image: ghcr.io/amruthpillai/reactive-resume:latest
     container_name: careerhub-cf-reactive-resume
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.careerhub-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.careerhub-resume-http.rule=Host(`${DOMAIN:-careerhub.local}`) && PathPrefix(`/resume`)"
+      - "traefik.http.routers.careerhub-resume-http.entrypoints=http"
+      - "traefik.http.routers.careerhub-resume-http.priority=10"
+      - "traefik.http.routers.careerhub-resume-http.middlewares=careerhub-https-redirect"
+      - "traefik.http.routers.careerhub-resume.rule=Host(`${DOMAIN:-careerhub.local}`) && PathPrefix(`/resume`)"
+      - "traefik.http.routers.careerhub-resume.entrypoints=https"
+      - "traefik.http.routers.careerhub-resume.priority=10"
+      - "traefik.http.routers.careerhub-resume.tls=true"
+      - "traefik.http.routers.careerhub-resume.tls.certresolver=letsencrypt"
+      - "traefik.http.services.careerhub-resume.loadbalancer.server.port=3000"
     networks:
       - careerhub-net
     ports:
@@ -285,6 +315,19 @@ services:
     image: ghcr.io/dakheera47/job-ops:latest
     container_name: careerhub-cf-jobops
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.careerhub-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.careerhub-jobops-http.rule=Host(`${DOMAIN:-careerhub.local}`) && PathPrefix(`/jobs`)"
+      - "traefik.http.routers.careerhub-jobops-http.entrypoints=http"
+      - "traefik.http.routers.careerhub-jobops-http.priority=10"
+      - "traefik.http.routers.careerhub-jobops-http.middlewares=careerhub-https-redirect"
+      - "traefik.http.routers.careerhub-jobops.rule=Host(`${DOMAIN:-careerhub.local}`) && PathPrefix(`/jobs`)"
+      - "traefik.http.routers.careerhub-jobops.entrypoints=https"
+      - "traefik.http.routers.careerhub-jobops.priority=10"
+      - "traefik.http.routers.careerhub-jobops.tls=true"
+      - "traefik.http.routers.careerhub-jobops.tls.certresolver=letsencrypt"
+      - "traefik.http.services.careerhub-jobops.loadbalancer.server.port=3001"
     networks:
       - careerhub-net
     ports:
@@ -323,6 +366,19 @@ services:
       dockerfile: Dockerfile
     container_name: careerhub-cf-resume-sync
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.careerhub-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.careerhub-syncapi-http.rule=Host(`${DOMAIN:-careerhub.local}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.careerhub-syncapi-http.entrypoints=http"
+      - "traefik.http.routers.careerhub-syncapi-http.priority=10"
+      - "traefik.http.routers.careerhub-syncapi-http.middlewares=careerhub-https-redirect"
+      - "traefik.http.routers.careerhub-syncapi.rule=Host(`${DOMAIN:-careerhub.local}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.careerhub-syncapi.entrypoints=https"
+      - "traefik.http.routers.careerhub-syncapi.priority=10"
+      - "traefik.http.routers.careerhub-syncapi.tls=true"
+      - "traefik.http.routers.careerhub-syncapi.tls.certresolver=letsencrypt"
+      - "traefik.http.services.careerhub-syncapi.loadbalancer.server.port=8000"
     networks:
       - careerhub-net
     ports:
@@ -362,6 +418,19 @@ services:
       dockerfile: Dockerfile
     container_name: careerhub-cf-dashboard
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.middlewares.careerhub-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.routers.careerhub-dashboard-http.rule=Host(`${DOMAIN:-careerhub.local}`)"
+      - "traefik.http.routers.careerhub-dashboard-http.entrypoints=http"
+      - "traefik.http.routers.careerhub-dashboard-http.priority=1"
+      - "traefik.http.routers.careerhub-dashboard-http.middlewares=careerhub-https-redirect"
+      - "traefik.http.routers.careerhub-dashboard.rule=Host(`${DOMAIN:-careerhub.local}`)"
+      - "traefik.http.routers.careerhub-dashboard.entrypoints=https"
+      - "traefik.http.routers.careerhub-dashboard.priority=1"
+      - "traefik.http.routers.careerhub-dashboard.tls=true"
+      - "traefik.http.routers.careerhub-dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.services.careerhub-dashboard.loadbalancer.server.port=3000"
     networks:
       - careerhub-net
     ports:
