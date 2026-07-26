@@ -283,6 +283,8 @@ Stops all services, restores volumes and databases, then restarts.
 
 ## Troubleshooting
 
+> The container names below (`careerhub-postgres`, etc.) apply to the Traefik deployment (`docker-compose.yml`). The Coolify deployment (`docker-compose.coolify.yml`) uses a `careerhub-cf-*` prefix instead (e.g. `careerhub-cf-postgres`, `careerhub-cf-reactive-resume`) to avoid name collisions if both stacks ever run on the same host.
+
 | Symptom | Likely Cause | Solution |
 |---|---|---|
 | Dashboard loads but `/resume` is blank | Reactive Resume still starting | Wait 30s, check logs: `docker logs careerhub-reactive-resume` |

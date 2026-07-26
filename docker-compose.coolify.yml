@@ -16,7 +16,7 @@
 #      │ dashboard           │ careerhub.example.com /  │ 3000     │
 #      │ reactive-resume     │ careerhub.example.com /resume/* │ 3003 │
 #      │ jobops              │ careerhub.example.com /jobs/*   │ 3005 │
-#      │ resume-sync-api     │ careerhub.example.com /api/*    │ 8000 │
+#      │ resume-sync-api     │ careerhub.example.com /api/*    │ 8010 │
 #      │ authentik-server    │ auth.careerhub.example.com      │ 9090 │
 #      └──────────────────────────┴──────────────────────────┴───────────┘
 #      Use a SUBDOMAIN for Authentik (auth.*) — sub-path routing (/auth/*)
@@ -77,7 +77,7 @@ services:
   # ---------------------------------------------------------------------------
   postgres:
     image: postgres:17-alpine
-    container_name: careerhub-postgres
+    container_name: careerhub-cf-postgres
     restart: unless-stopped
     networks:
       - careerhub-net
@@ -100,7 +100,7 @@ services:
   # ---------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
-    container_name: careerhub-redis
+    container_name: careerhub-cf-redis
     restart: unless-stopped
     networks:
       - careerhub-net
@@ -111,7 +111,6 @@ services:
       --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
-      - ./configs/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -124,7 +123,7 @@ services:
   # ---------------------------------------------------------------------------
   seaweedfs:
     image: chrislusf/seaweedfs:4.40
-    container_name: careerhub-seaweedfs
+    container_name: careerhub-cf-seaweedfs
     restart: unless-stopped
     networks:
       - careerhub-net
@@ -143,7 +142,7 @@ services:
 
   seaweedfs-init:
     image: quay.io/minio/mc:latest
-    container_name: careerhub-seaweedfs-init
+    container_name: careerhub-cf-seaweedfs-init
     restart: "no"
     networks:
       - careerhub-net
@@ -163,7 +162,7 @@ services:
   # ===========================================================================
   authentik-redis:
     image: redis:7-alpine
-    container_name: careerhub-authentik-redis
+    container_name: careerhub-cf-authentik-redis
     restart: unless-stopped
     networks:
       - careerhub-net
@@ -179,7 +178,7 @@ services:
 
   authentik-server:
     image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-2025.6}
-    container_name: careerhub-authentik-server
+    container_name: careerhub-cf-authentik-server
     restart: unless-stopped
     networks:
       - careerhub-net
@@ -213,7 +212,7 @@ services:
 
   authentik-worker:
     image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-2025.6}
-    container_name: careerhub-authentik-worker
+    container_name: careerhub-cf-authentik-worker
     restart: unless-stopped
     networks:
       - careerhub-net
@@ -236,7 +235,7 @@ services:
       authentik-server:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "celery", "-A", "authentik.root.celery", "inspect", "ping", "-d", "celery@$(hostname)"]
+      test: ["CMD-SHELL", "celery -A authentik.root.celery inspect ping -d celery@$(hostname)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -247,7 +246,7 @@ services:
   # ===========================================================================
   reactive-resume:
     image: ghcr.io/amruthpillai/reactive-resume:latest
-    container_name: careerhub-reactive-resume
+    container_name: careerhub-cf-reactive-resume
     restart: unless-stopped
     networks:
       - careerhub-net
@@ -296,7 +295,7 @@ services:
   # ===========================================================================
   jobops:
     image: ghcr.io/dakheera47/job-ops:latest
-    container_name: careerhub-jobops
+    container_name: careerhub-cf-jobops
     restart: unless-stopped
     networks:
       - careerhub-net
@@ -332,12 +331,12 @@ services:
     build:
       context: ./resume-sync-api
       dockerfile: Dockerfile
-    container_name: careerhub-resume-sync
+    container_name: careerhub-cf-resume-sync
     restart: unless-stopped
     networks:
       - careerhub-net
     ports:
-      - "8000:8000"
+      - "8010:8000"
     environment:
       DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/resume_sync"
       REDIS_URL: "redis://redis:6379/1"
@@ -369,7 +368,7 @@ services:
     build:
       context: ./dashboard
       dockerfile: Dockerfile
-    container_name: careerhub-dashboard
+    container_name: careerhub-cf-dashboard
     restart: unless-stopped
     networks:
       - careerhub-net
@@ -380,7 +379,7 @@ services:
       NEXT_PUBLIC_API_URL: "/api"
       NEXT_PUBLIC_RESUME_URL: "/resume"
       NEXT_PUBLIC_JOBS_URL: "/jobs"
-      NEXT_PUBLIC_AUTH_URL: "/auth"
+      NEXT_PUBLIC_AUTH_URL: "https://auth.${DOMAIN:-careerhub.local}"
       NEXT_PUBLIC_DOMAIN: "${DOMAIN:-careerhub.local}"
       SYNC_API_URL: "http://resume-sync-api:8000"
       AUTHENTIK_URL: "http://authentik-server:9000"
