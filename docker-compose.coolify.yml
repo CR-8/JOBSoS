@@ -46,8 +46,6 @@ volumes:
     name: careerhub-postgres
   redis_data:
     name: careerhub-redis
-  seaweedfs_data:
-    name: careerhub-seaweedfs
   authentik_db:
     name: careerhub-authentik-db
   authentik_media:
@@ -117,45 +115,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
-
-  # ---------------------------------------------------------------------------
-  # SeaweedFS - S3-compatible storage
-  # ---------------------------------------------------------------------------
-  seaweedfs:
-    image: chrislusf/seaweedfs:4.40
-    container_name: careerhub-cf-seaweedfs
-    restart: unless-stopped
-    networks:
-      - careerhub-net
-    command: server -s3 -filer -dir=/data -ip=0.0.0.0
-    environment:
-      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-seaweedfs}
-      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-seaweedfs}
-    volumes:
-      - seaweedfs_data:/data
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8888"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
-  seaweedfs-init:
-    image: quay.io/minio/mc:latest
-    container_name: careerhub-cf-seaweedfs-init
-    restart: "no"
-    networks:
-      - careerhub-net
-    entrypoint: >
-      /bin/sh -c "
-        sleep 5;
-        mc alias set seaweedfs http://seaweedfs:8333 ${S3_ACCESS_KEY_ID:-seaweedfs} ${S3_SECRET_ACCESS_KEY:-seaweedfs};
-        mc mb --ignore-existing seaweedfs/reactive-resume;
-        exit 0;
-      "
-    depends_on:
-      seaweedfs:
-        condition: service_healthy
 
   # ---------------------------------------------------------------------------
   # Postgres DB bootstrap - idempotent, runs on every deploy.
@@ -294,12 +253,8 @@ services:
       REDIS_URL: "redis://redis:6379/0"
       AUTH_SECRET: "${RR_AUTH_SECRET}"
       ENCRYPTION_SECRET: "${RR_ENCRYPTION_SECRET}"
-      S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY_ID:-seaweedfs}"
-      S3_SECRET_ACCESS_KEY: "${S3_SECRET_ACCESS_KEY:-seaweedfs}"
-      S3_REGION: "${S3_REGION:-us-east-1}"
-      S3_ENDPOINT: "http://seaweedfs:8333"
-      S3_BUCKET: "reactive-resume"
-      S3_FORCE_PATH_STYLE: "true"
+      # No S3_* vars set -> Reactive Resume falls back to local filesystem
+      # storage at /app/data (backed by the rr_data volume below).
       OAUTH_PROVIDER_NAME: "${OAUTH_PROVIDER_NAME:-CareerHub SSO}"
       OAUTH_CLIENT_ID: "${RR_OIDC_CLIENT_ID}"
       OAUTH_CLIENT_SECRET: "${RR_OIDC_CLIENT_SECRET}"
@@ -316,10 +271,6 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
-      seaweedfs:
-        condition: service_healthy
-      seaweedfs-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r => { if (!r.ok) process.exit(1); }).catch(() => process.exit(1));"]
       interval: 30s

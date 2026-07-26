@@ -30,7 +30,7 @@ Internet
 ┌─────────────────────────────────────────────────────────┐
 │  PostgreSQL ──── separate databases per application     │
 │  Redis  ──────── shared cache (separate logical DBs)    │
-│  SeaweedFS ───── S3-compatible storage for uploads      │
+│  rr_data volume ─ local filesystem storage for uploads  │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -98,7 +98,6 @@ See `.env.example` for the complete list. Key variables:
 | Traefik | `traefik:v3.2` | 80, 443 | Built-in ping |
 | PostgreSQL | `postgres:17-alpine` | Internal | `pg_isready` |
 | Redis | `redis:7-alpine` | Internal | `redis-cli ping` |
-| SeaweedFS | `chrislusf/seaweedfs:latest` | Internal | HTTP 8888 |
 | Authentik Server | `ghcr.io/goauthentik/server` | Internal | `/health/ready/` |
 | Authentik Worker | `ghcr.io/goauthentik/server` | Internal | celery inspect |
 | Reactive Resume | `ghcr.io/amruthpillai/reactive-resume` | Internal | `/api/health` |
@@ -303,7 +302,7 @@ Stops all services, restores volumes and databases, then restarts.
 2.  **JobOps uses SQLite**, not PostgreSQL. This is an upstream design choice. The JobOps SQLite database lives in a Docker volume and is backed up as a volume snapshot.
 3.  **Reactive Resume's self-hosted API is not fully documented for external consumption.** The Resume Sync API uses best-effort HTTP calls to Reactive Resume's internal API. Some integration points may require upstream API additions.
 4.  **No automatic user provisioning across services.** Each application has its own user model. Authentik provides SSO at the auth layer, but user metadata is not synchronized across applications.
-5.  **SeaweedFS single-node only.** For high availability, deploy SeaweedFS in a clustered configuration.
+5.  **Reactive Resume uploads live on a single local volume (`rr_data`).** There's no built-in Cloudinary support in Reactive Resume — it only supports S3-compatible object storage or local filesystem. This deployment uses local filesystem storage, so back up the `rr_data` volume like any other stateful volume.
 
 ## Future Roadmap
 
