@@ -123,7 +123,7 @@ services:
   # SeaweedFS - S3-compatible storage
   # ---------------------------------------------------------------------------
   seaweedfs:
-    image: chrislusf/seaweedfs:latest
+    image: chrislusf/seaweedfs:4.40
     container_name: careerhub-seaweedfs
     restart: unless-stopped
     networks:
@@ -167,7 +167,7 @@ services:
     restart: unless-stopped
     networks:
       - careerhub-net
-    command: redis-server --save 60s 1 --loglevel warning
+    command: redis-server --save 60 1 --dbfilename dump-authentik.rdb --loglevel warning
     volumes:
       - authentik_redis:/data
     healthcheck:
@@ -175,6 +175,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 15s
 
   authentik-server:
     image: ghcr.io/goauthentik/server:${AUTHENTIK_VERSION:-2025.6}
