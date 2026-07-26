@@ -157,6 +157,37 @@ services:
       seaweedfs:
         condition: service_healthy
 
+  # ---------------------------------------------------------------------------
+  # Postgres DB bootstrap - idempotent, runs on every deploy.
+  # init.sql only fires on a truly empty volume, so on a volume that already
+  # has data (e.g. from an earlier failed deploy) the app databases never get
+  # created. This creates any that are missing every time, safely.
+  # ---------------------------------------------------------------------------
+  postgres-init:
+    image: postgres:17-alpine
+    container_name: careerhub-cf-postgres-init
+    restart: "no"
+    networks:
+      - careerhub-net
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+        set -e;
+        for db in reactive_resume jobops resume_sync authentik; do
+          exists=$$(psql -h postgres -U ${POSTGRES_USER} -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname='$$db'\");
+          if [ \"$$exists\" = \"1\" ]; then
+            echo \"Database $$db already exists\";
+          else
+            echo \"Creating database $$db\";
+            psql -h postgres -U ${POSTGRES_USER} -d postgres -c \"CREATE DATABASE $$db\";
+          fi;
+        done
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   # ===========================================================================
   # Authentik - Single Sign-On
   # ===========================================================================
@@ -201,6 +232,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
       authentik-redis:
         condition: service_healthy
     healthcheck:
@@ -230,6 +263,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
       authentik-redis:
         condition: service_healthy
       authentik-server:
@@ -277,6 +312,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       seaweedfs:
@@ -317,6 +354,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
       interval: 30s
@@ -350,6 +389,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       reactive-resume:
